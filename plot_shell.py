@@ -2,12 +2,16 @@
 
 import os
 import errno
+import shutil
+import logging
+import subprocess
+import datetime as dt
 
 import gspread as gs
 from oauth2client.service_account import ServiceAccountCredentials as SaC
 
-import datetime as dt
 import numpy as np
+import pandas as pd
 
 from lxml import etree
 from svgpath2mpl import parse_path
@@ -37,13 +41,22 @@ def sheet_data():
     client = gs.authorize(creds)
 
     sheet = client.open("2018 Jolly miles for 2018").sheet1
-    holly_d = 1009.0 - float(sheet.cell(4, 3).value)
-    joe_d = 1009.0 - float(sheet.cell(4, 2).value)
+    data = sheet.range(f'A7:D{sheet.row_count}')
 
-    return holly_d, joe_d
+    col_idx = np.arange(0, len(data), 4)
+
+    dates = [dt.datetime.strptime(data[idx].value, "%m/%d/%Y") for idx in col_idx if data[idx].value != '']
+    joe_m = [float(data[idx + 1].value) for idx in col_idx if data[idx].value != '']
+    holly_m = [float(data[idx + 2].value) for idx in col_idx if data[idx].value != '']
+    method = [data[idx + 3].value for idx in col_idx if data[idx].value != '']
+
+    frame = pd.DataFrame({'days': dates, 'joe_miles': joe_m, 'holly_miles': holly_m, 'method': method})
+    frame = frame.set_index(frame['days'])
+
+    return frame
 
 
-def plot_shell(date=dt.date(2017, 12, 31), pace_d=0, joe_d=0, holly_d=0, plot_file='output/jolly_miles_0.png'):
+def plot_shell(date=dt.date(2017, 12, 31), pace_d=0.0, joe_d=0.0, holly_d=0.0, plot_file='output/jolly_miles_0.png'):
     """
     Plot a rowing shell by importing an svg and turning it into a matplotlib path.
     """
@@ -56,14 +69,13 @@ def plot_shell(date=dt.date(2017, 12, 31), pace_d=0, joe_d=0, holly_d=0, plot_fi
     svg_height = int(svg_root.attrib['height'][:-2])
     svg_aspect_ratio = svg_height / svg_width
 
-    svg_paths = []
+    pace_boat = []
     for svg_elem in svg_tree.iter():
         if svg_elem.tag.split('}')[1] == 'path':
-            svg_paths.append(parse_path(svg_elem.get('d')))
+            pace_boat.append(parse_path(svg_elem.get('d')))
 
-    pace_boat = svg_paths.copy()
-    holly_boat = svg_paths.copy()
-    joe_boat = svg_paths.copy()
+    holly_boat = pace_boat.copy()
+    joe_boat = pace_boat.copy()
 
     boat_width = 250.0
     scale_factor = boat_width / svg_width
@@ -127,16 +139,34 @@ def plot_shell(date=dt.date(2017, 12, 31), pace_d=0, joe_d=0, holly_d=0, plot_fi
 
     fig.tight_layout()
     plt.savefig(plot_file)
-    plt.show()
+    plt.close()
 
 
 if __name__ == '__main__':
-    today = dt.date.today()
-    day_of_year = today.timetuple().tm_yday
-    pf = f'output/jolly_miles_{day_of_year}.png'
-    mkdir_p(os.path.dirname(pf))
+    mkdir_p('output/')
 
-    hd, jd = sheet_data()
-    pd = day_of_year/365.0 * 1009.0
+    records = sheet_data()
+    year = pd.DataFrame()
+    year['joe_miles'] = records.joe_miles.resample('D').sum().fillna(0)
+    year['holly_miles'] = records.holly_miles.resample('D').sum().fillna(0)
 
-    plot_shell(date=today, pace_d=pd, holly_d=hd, joe_d=jd, plot_file=pf)
+    year_ix = pd.DatetimeIndex(start=dt.datetime(2017,12,31), end=dt.datetime(2018,12,31), freq='D')
+    year = year.reindex(year_ix).fillna(0)
+
+    year['joe_d'] = year.joe_miles.cumsum()
+    year['holly_d'] = year.holly_miles.cumsum()
+    year['pace_d'] = [day.timetuple().tm_yday * 1009.0/365.0 for day in year.index]
+    year['pace_d'][0] = 0  # Fix last year start value
+
+    d0 = year.index[0]
+    plot_shell(date=d0.date(), pace_d=year.pace_d[d0], joe_d=year.joe_d[d0], holly_d=year.holly_d[d0],
+               plot_file=f'output/jolly_miles_{0:03d}.png')
+
+    for day in year.index[1:]:
+        plot_shell(date=day.date(), pace_d=year.pace_d[day], joe_d=year.joe_d[day], holly_d=year.holly_d[day],
+                   plot_file=f'output/jolly_miles_{day.timetuple().tm_yday:03d}.png')
+
+    if shutil.which('convert') is not None:
+        subprocess.check_call(['convert', '-delay', '5', '-loop', '0', '-layers', 'Optimize', '*.png', 'jolly_miles.gif'], cwd='output/')
+    else:
+        logging.warning("ImageMagick's convert utility required for gif creation!")
